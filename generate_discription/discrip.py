@@ -1,5 +1,5 @@
 import copy
-
+from scipy.stats import norm
 import cv2
 import torch
 from PIL import Image, ImageDraw
@@ -11,6 +11,7 @@ from torchvision import transforms
 import math
 import cv2 as cv
 import torch.nn.functional as F
+import openai
 
 def load_blip_model():
     local_path = "/home/cscv/Documents/lsl/SeqTrackv2/generate_discription/blip-image-captioning-base"
@@ -23,6 +24,52 @@ def load_blip_model():
     except Exception as e:
         print(f"failed to load blip model: {e}")
         return None, None
+
+def crop_image_CDF(image, bbox, output_img_path):
+    width, height = image.size
+
+    x_left, y_top, x_right, y_bottom = bbox
+    w = (x_right - x_left)
+    h = (y_bottom - y_top)
+    x = x_left + w / 2
+    y = y_top + h / 2
+
+    # k_values = [2, 4, 6, 8]
+    k_values = [0.5, 1, 2]
+
+    cropped_images = []
+
+    for k in k_values:
+        sigma_x = w / k
+        sigma_y = h / k
+
+        def cdf_x(z):
+            return norm.cdf(z, x, sigma_x)
+
+        def cdf_y(z):
+            return norm.cdf(z, y, sigma_y)
+
+        prob_x = cdf_x(x + w / 2) - cdf_x(x - w / 2)
+        prob_y = cdf_y(y + h / 2) - cdf_y(y - h / 2)
+
+        w_new = w / prob_x
+        h_new = h / prob_y
+
+        left = max(0, int(x - w_new / 2))
+        top = max(0, int(y - h_new / 2))
+        right = min(width, int(x + w_new / 2))
+        bottom = min(height, int(y + h_new / 2))
+
+        # cropped_image = image[top:bottom, left:right]
+        cropped_image = image.crop((left, top, right, bottom))
+        cropped_images.append(cropped_image)
+
+    #     cv2.imwrite(f'cropped_k_{k}.jpg', cropped_image)
+    #     cv2.imshow(f'k = {k}', cropped_image)
+    #     cv2.waitKey(0)
+    #
+    # cv2.destroyAllWindows()
+    return cropped_images, k_values
 
 def crop_image(image, bbox):
     x_min, y_min, x_max, y_max = bbox
@@ -180,20 +227,21 @@ def generate_caption(image, processor, model):
         print(f"failed to generate description: {e}")
         return None
 
-def save_descriptions_to_file(video_folder_path, object_description, context_description):
+
+def save_descriptions_to_file(video_folder_path, context_descriptions, k_values):
 
     try:
         language_file_path = os.path.join(video_folder_path, "language.txt")
         with open(language_file_path, "w") as f:
-            f.write(f"The object is {object_description}\n")
-            f.write(f"The surrounding context is {context_description}\n")
+            for i in range(len(k_values)):
+                f.write(f"{context_descriptions[i]}\n")
         print(f"description has been saved: {language_file_path}")
     except Exception as e:
         print(f"failed to save description: {e}")
 
 def read_bbox_from_init(video_folder_path):
 
-    init_file_path = os.path.join(video_folder_path, "visible.txt")
+    init_file_path = os.path.join(video_folder_path, "init.txt")
     with open(init_file_path, "r") as f:
         first_line = f.readline().strip()
         # first_line = [int(x) for x in first_line.split()]
@@ -211,18 +259,39 @@ def describe_object_and_context(image_path, bbox, processor, model, output_img_p
     image = Image.open(image_path)
     # draw_box(copy.deepcopy(image), bbox, output_img_path, "gt-img.jpg")
 
-    object_image = crop_image(image, bbox)
-    draw_box(copy.deepcopy(object_image), bbox, output_img_path, "forground.jpg")
-    object_description = generate_caption(object_image, processor, model)
+    # object_image = crop_image(image, bbox)
+    # draw_box(copy.deepcopy(object_image), bbox, output_img_path, "forground.jpg")
+    # object_description = generate_caption(object_image, processor, model)
 
-    context_image = crop_around_object(image, bbox, output_img_path)
-    draw_box(copy.deepcopy(context_image), bbox, output_img_path, "context.jpg")
-    context_description = generate_caption(context_image, processor, model)
+    # context_image = crop_around_object(image, bbox, output_img_path)
+    # draw_box(copy.deepcopy(context_image), bbox, output_img_path, "context.jpg")
+    # context_description = generate_caption(context_image, processor, model)
 
-    return object_description, context_description
+    context_images, k_values = crop_image_CDF(image, bbox, output_img_path)
+    # draw_box(copy.deepcopy(context_images[0]), bbox, output_img_path, "context_0.5.jpg")
+    # draw_box(copy.deepcopy(context_images[1]), bbox, output_img_path, "context_1.jpg")
+    # draw_box(copy.deepcopy(context_images[2]), bbox, output_img_path, "context_2.jpg")
+    context_descriptions = []
+    for i in range(len(k_values)):
+        context_descriptions.append(generate_caption(context_images[i], processor, model))
+    context_description = " ".join(context_descriptions)
+    context_descriptions.append(context_description)
+    k_values.append(6)
+    return context_descriptions, k_values
     # except Exception as e:
     #     print(f"failed to generate description: {e}")
     #     return None, None
+
+def optimize_description_with_chatgpt(context_descriptions):
+    context_description = "".join(context_descriptions)
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+        message={
+            {"role": "system", "content": "you are a helpful assistent ans can optimize the discription of a image"},
+            {"role": "user", "content": f":please optimize the multi-scale image discriptions to a more concise description\n{context_description}"}
+        }
+    )
+    return response['choices'][0]['message']['content']
 
 def process_video_sequences(root_dir, processor, model):
 
@@ -247,9 +316,10 @@ def process_video_sequences(root_dir, processor, model):
                         print("can't read box")
                         continue
 
-                    object_description, context_description = describe_object_and_context(first_image_path, bbox, processor, model, video_folder_path)
-                    if object_description and context_description:
-                        save_descriptions_to_file(video_folder_path, object_description, context_description)
+                    context_descriptions, k_values = describe_object_and_context(first_image_path, bbox, processor, model, video_folder_path)
+                    # context_descriptions = optimize_description_with_chatgpt(context_descriptions)
+                    if context_descriptions:
+                        save_descriptions_to_file(video_folder_path, context_descriptions, k_values)
                     else:
                         print("can't generate description")
                 else:
@@ -258,7 +328,7 @@ def process_video_sequences(root_dir, processor, model):
                 print(f"can't find visible folder: {visible_folder}")
 
 def main():
-    root_directory = "/home/cscv/Documents/lsl/dataset/RGB-T234"
+    root_directory = "/media/cscv/d00985a0-c3e6-4ffa-9546-88c861db5ce3/02_Dataset/LasHeR/trainingset_ori"
 
     processor, model = load_blip_model()
     if processor is None or model is None:
