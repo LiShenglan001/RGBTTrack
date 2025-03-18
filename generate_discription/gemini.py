@@ -1,11 +1,16 @@
 import copy
 from scipy.stats import norm
-import cv2
 import torch
 from PIL import Image, ImageDraw
-from transformers import BlipProcessor, BlipForConditionalGeneration
-from transformers import Blip2Processor, Blip2ForConditionalGeneration
-from google.cloud import aiplatform
+import google.generativeai as genai
+import pathlib
+import textwrap
+from IPython.display import display
+from IPython.display import Markdown
+from google.auth import default
+from google.api_core.retry import Retry
+from google.api_core.exceptions import TooManyRequests
+import time
 import os
 import numpy as np
 import ast
@@ -13,25 +18,22 @@ from torchvision import transforms
 import math
 import cv2 as cv
 import torch.nn.functional as F
-import openai
 
-def load_blip_model():
-    try:
-        local_path = "/media/cscv/d00985a0-c3e6-4ffa-9546-88c861db5ce3/02_Dataset/LasHeR/blip2-opt-2.7b"
-        # local_path = "/home/cscv/Documents/lsl/SeqTrackv2/generate_discription/blip-image-captioning-base"
-        processor = Blip2Processor.from_pretrained(local_path)
-        model = Blip2ForConditionalGeneration.from_pretrained(local_path, torch_dtype=torch.float16)
-        model.to("cuda")
-        # processor = BlipProcessor.from_pretrained(local_path)
-        # model = BlipForConditionalGeneration.from_pretrained(local_path, torch_dtype=torch.float16)
-        # model.to("cuda")
-        # processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        # model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base").to("cuda")
-        return processor, model
-    except Exception as e:
-        print(f"failed to load blip model: {e}")
-        return None, None
+def load_gemini_model():
+    os.environ["HTTP_PROXY"] = "http://127.0.0.1:7890"
+    os.environ["HTTPs_PROXY"] = "http://127.0.0.1:7890"
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/cscv/Documents/lsl/SeqTrackv2/generate_discription/avid-catalyst-453707-h4-452f6de54af5.json"
+    GOOGLE_API_KEY=os.getenv('AIzaSyBVEzCz_ME85lWHTNTfY6r2LfxmzY_fdFo')
+    genai.configure(api_key=GOOGLE_API_KEY, transport='rest')
+    # creds, project = default()
+    # print("Credentials:", creds)
+    # print("Project:", project)
+    for m in genai.list_models():
+        print(m.name)
+        print(m.supported_generation_methods)
+    model = genai.GenerativeModel('gemini-1.5-flash') #'gemini-2.0-pro-exp'
 
+    return model
 
 def crop_image_CDF(image, bbox, output_img_path):
     width, height = image.size
@@ -43,7 +45,7 @@ def crop_image_CDF(image, bbox, output_img_path):
     y = y_top + h / 2
 
     # k_values = [2, 4, 6, 8]
-    k_values = [6, 12, 24]
+    k_values = [24]
 
     cropped_images = []
 
@@ -224,19 +226,40 @@ def crop_around_object(image,bbox_ori,output_img_path,search_area_factor=4.0,out
     # cv2.waitKey()
     return Image.fromarray(crops)
 
-def generate_caption(image, processor, model):
+def to_markdown(text):
+    text = text.replace('.', '*')
+    return Markdown(textwrap.indent(text, '>', predicate=lambda _:True))
 
-    inputs = processor(image, "The brief description of this image is:", return_tensors="pt").to("cuda", torch.float16)
-    out = model.generate(**inputs, max_length=100, num_return_sequences=1)
-    description = processor.decode(out[0], skip_special_tokens=True)
-    description = description.strip()
-    description = description.replace('"', '')
-    description = description.replace("'", '')
-    description = description.replace("\n", '')
-    if "," in description:
-        description = description.split(',')[0]
-    if not description.strip():
-        description = "No description generated"
+def generate_caption(image, model):
+    prompt = "Describe this image in one sentence within 20 words, without using any commas and without any additional text."
+    # prompt = """
+    # Describe the image in 40 words. Use short phrases. Follow this order:
+    # 1. Main subject: appearance, shape, structure, texture, patterns
+    # 2. Secondary elements: key features
+    # 3. Spatial composition and perspective
+    # """
+    # response = model.generate_content([prompt, image], stream=False)
+    # response.resolve()
+    # description = response.text
+    # description = description.strip()
+    # description = description.replace('"', '')
+    # description = description.replace("'", '')
+    # description = description.replace("\n", '')
+    # return description
+    while True:
+        try:
+            response = model.generate_content([prompt, image], stream=False)
+            response.resolve()
+            description = response.text
+            description = description.strip()
+            description = description.replace('"', '')
+            description = description.replace("'", '')
+            description = description.replace("\n", '')
+            # to_markdown(response.text)
+            break
+        except TooManyRequests as e:
+            if e.code == 429:
+                continue
     return description
 
 def save_descriptions_to_file(video_folder_path, context_descriptions):
@@ -266,7 +289,7 @@ def draw_box(img, box, output_image_path, outputname):
     output_image_path = os.path.join(output_image_path, outputname)
     img.save(output_image_path)
 
-def describe_object_and_context(image_path, bbox, processor, model, output_img_path):
+def describe_object_and_context(image_path, bbox, model, output_img_path):
     image = Image.open(image_path)
     # draw_box(copy.deepcopy(image), bbox, output_img_path, "gt-img.jpg")
 
@@ -284,12 +307,12 @@ def describe_object_and_context(image_path, bbox, processor, model, output_img_p
     # draw_box(copy.deepcopy(context_images[2]), bbox, output_img_path, "context_2.jpg")
     context_descriptions = []
     for i in range(len(k_values)):
-        context_descriptions.append(generate_caption(context_images[i], processor, model))
-    context_description = " ".join(context_descriptions)
-    context_descriptions.append(context_description)
+        context_descriptions.append(generate_caption(context_images[i], model))
+    # context_description = " ".join(context_descriptions)
+    context_descriptions.append(context_descriptions)
     return context_descriptions
 
-def process_video_sequences(root_dir, processor, model):
+def process_video_sequences(root_dir, model):
 
     for video_folder in os.listdir(root_dir):
         video_folder_path = os.path.join(root_dir, video_folder)
@@ -312,7 +335,7 @@ def process_video_sequences(root_dir, processor, model):
                         print("can't read box")
                         continue
 
-                    context_descriptions = describe_object_and_context(first_image_path, bbox, processor, model, video_folder_path)
+                    context_descriptions = describe_object_and_context(first_image_path, bbox, model, video_folder_path)
                     # context_descriptions = optimize_description_with_chatgpt(context_descriptions)
                     if context_descriptions:
                         save_descriptions_to_file(video_folder_path, context_descriptions)
@@ -325,11 +348,11 @@ def process_video_sequences(root_dir, processor, model):
 
 def main():
     root_directory = "/media/cscv/d00985a0-c3e6-4ffa-9546-88c861db5ce3/02_Dataset/LasHeR/trainingset_ori"
-    processor, model = load_blip_model()
-    if processor is None or model is None:
+    model = load_gemini_model()
+    if model is None:
         return
 
-    process_video_sequences(root_directory, processor, model)
+    process_video_sequences(root_directory, model)
 
 if __name__ == "__main__":
     main()

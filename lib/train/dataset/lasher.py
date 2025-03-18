@@ -75,14 +75,14 @@ class LasHeR(BaseVideoDataset):
         return torch.tensor(rgb_gt)
 
     def _read_nlp(self, seq_path):
-        nlp_file = os.path.join(seq_path, "language.txt")
+        nlp_file = os.path.join(seq_path, "BLIP2.txt")
         nlp = ""
         try:
-            nlp = pandas.read_csv(nlp_file, dtype=str, header=None, low_memory=False, nrows=2).values
+            nlp = pandas.read_csv(nlp_file, dtype=str, header=None, low_memory=False, nrows=1).values
         except Exception as e:
             print(e)
             print(f'nlp_file:{nlp_file}')
-        return nlp[3][0]
+        return nlp[0][0]
 
     def _get_sequence_path(self, seq_id):
         return os.path.join(self.root, self.sequence_list[seq_id])

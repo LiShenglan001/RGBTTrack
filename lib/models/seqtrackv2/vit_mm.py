@@ -210,6 +210,7 @@ class VisionTransformerMM(nn.Module):
         self.embed_dim_list = [embed_dim]
         self.num_search = search_number
         self.num_template = template_number
+        self.token_type_embedding = True
 
         self.patch_embed = PatchEmbed(
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -223,6 +224,12 @@ class VisionTransformerMM(nn.Module):
         # self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches_search + self.num_patches_template, embed_dim))
         self.pos_embed_search = nn.Parameter(torch.zeros(1, self.num_patches_search, embed_dim))
         self.pos_embed_template = nn.Parameter(torch.zeros(1, self.num_patches_template, embed_dim))
+
+        if self.token_type_indicate:
+            self.template_background_token = nn.Parameter(torch.zeros(embed_dim))
+            self.template_foreground_token = nn.Parameter(torch.zeros(embed_dim))
+            self.search_background_token = nn.Parameter(torch.zeros(embed_dim))
+            self.search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 

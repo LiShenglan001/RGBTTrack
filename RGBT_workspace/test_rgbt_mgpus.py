@@ -166,7 +166,7 @@ if __name__ == '__main__':
     parser.add_argument('--script_name', type=str, default='seqtrackv2', help='Name of tracking method(ostrack, prompt, ftuning).')
     # parser.add_argument('--yaml_name', type=str, default='ostrack_ce_ep60_prompt_iv21b_wofovea_8_onlylasher_2xa100_rgbt', help='Name of tracking method.')  # vitb_256_mae_ce_32x4_ep300 vitb_256_mae_ce_32x4_ep60_prompt_i32v21_onlylasher_rgbt
     parser.add_argument('--yaml_name', type=str, default='seqtrackv2_b256', help='Name of tracking method.')  # vitb_256_mae_ce_32x4_ep300 vitb_256_mae_ce_32x4_ep60_prompt_i32v21_onlylasher_rgbt
-    parser.add_argument('--dataset_name', type=str, default='LasHeR', help='Name of dataset (GTOT,RGBT234,LasHeR,VTUAVST,VTUAVLT).')
+    parser.add_argument('--dataset_name', type=str, default='VTUAVST', help='Name of dataset (GTOT,RGBT234,LasHeR,VTUAVST,VTUAVLT).')
     parser.add_argument('--threads', default=0, type=int, help='Number of threads')
     parser.add_argument('--num_gpus', default=torch.cuda.device_count(), type=int, help='Number of gpus')
     parser.add_argument('--mode', default='sequential', type=str, help='sequential or parallel')
