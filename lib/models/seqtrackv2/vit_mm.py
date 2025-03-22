@@ -210,8 +210,8 @@ class VisionTransformerMM(nn.Module):
         self.embed_dim_list = [embed_dim]
         self.num_search = search_number
         self.num_template = template_number
-        self.token_type_embedding = True
-
+        self.token_type_indicate = True
+        self.patch_size = patch_size
         self.patch_embed = PatchEmbed(
             patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
 
@@ -228,8 +228,8 @@ class VisionTransformerMM(nn.Module):
         if self.token_type_indicate:
             self.template_background_token = nn.Parameter(torch.zeros(embed_dim))
             self.template_foreground_token = nn.Parameter(torch.zeros(embed_dim))
-            self.search_background_token = nn.Parameter(torch.zeros(embed_dim))
-            self.search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
+            self.search_token = nn.Parameter(torch.zeros(embed_dim))
+            # self.search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
 
         self.pos_drop = nn.Dropout(p=drop_rate)
 
@@ -277,7 +277,28 @@ class VisionTransformerMM(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+    def create_mask(self, image, image_anno):
+        height = image.size(2)
+        width = image.size(3)
 
+        # Extract bounding box coordinates
+        x0 = (image_anno[:, 0] * width).unsqueeze(1)
+        y0 = (image_anno[:, 1] * height).unsqueeze(1)
+        w = (image_anno[:, 2] * width).unsqueeze(1)
+        h = (image_anno[:, 3] * height).unsqueeze(1)
+
+        # Generate pixel indices
+        x_indices = torch.arange(width, device=image.device)
+        y_indices = torch.arange(height, device=image.device)
+
+        # Create masks for x and y coordinates within the bounding boxes
+        x_mask = ((x_indices >= x0) & (x_indices < x0 + w)).float()
+        y_mask = ((y_indices >= y0) & (y_indices < y0 + h)).float()
+
+        # Combine x and y masks to get final mask
+        mask = x_mask.unsqueeze(1) * y_mask.unsqueeze(2) # (b,h,w)
+
+        return mask
     @torch.jit.ignore
     def no_weight_decay(self):
         return {'pos_embed', 'cls_token'}
@@ -289,7 +310,7 @@ class VisionTransformerMM(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, template_list, search_list, text_src, seq):
+    def forward_features(self, template_list, search_list, text_src, seq, z_anno):
         num_template = len(template_list)
         num_search = len(search_list)
         if self.instruct:
@@ -306,6 +327,24 @@ class VisionTransformerMM(nn.Module):
         # multi-modal image
         x_dte = x[:, 3:, :, :]
         z_dte = z[:, 3:, :, :]
+
+        if self.token_type_indicate:
+            # generate a foreground mask
+            z_indicate_mask = self.create_mask(z, z_anno)
+            z_indicate_mask = z_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size,
+                                                                                                 self.patch_size)  # to match the patch embedding
+            z_indicate_mask = z_indicate_mask.mean(dim=(3, 4)).flatten(
+                1)  # elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
+
+        if self.token_type_indicate:
+            # generate the indicate_embeddings for z
+            template_background_token = self.template_background_token.unsqueeze(0).unsqueeze(1).expand(
+                z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
+            template_foreground_token = self.template_foreground_token.unsqueeze(0).unsqueeze(1).expand(
+                z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
+            weighted_foreground = template_foreground_token * z_indicate_mask.unsqueeze(-1)
+            weighted_background = template_background_token * (1 - z_indicate_mask.unsqueeze(-1))
+            z_indicate = weighted_foreground + weighted_background
 
         x_rgb = self.patch_embed(x_rgb)
         z_rgb = self.patch_embed(z_rgb)
@@ -328,6 +367,12 @@ class VisionTransformerMM(nn.Module):
             z = z_rgb + z_dte
             z = z + self.pos_embed_template
             x = x + self.pos_embed_search
+            if self.token_type_indicate:
+                # generate the indicate_embeddings for x
+                x_indicate = self.search_token.unsqueeze(0).unsqueeze(1).expand(x.size(0), x.size(1), self.embed_dim)
+                # add indicate_embeddings to z and x
+                x = x + x_indicate
+                z = z + z_indicate
             x_dte = x_dte.reshape(-1, num_search * x_dte.size(1), x_dte.size(-1))
             z_dte = z_dte.reshape(-1, num_template * z_dte.size(1), z_dte.size(-1))
             z = z.reshape(-1, num_template * z.size(1), z.size(-1))
@@ -418,9 +463,9 @@ class VisionTransformerMM(nn.Module):
         xz = self.norm(xz) # B,N,C
         return xz
 
-    def forward(self, template_list, search_list, text_src, seq):
-        xz = self.forward_features(template_list, search_list, text_src, seq)
-        out=[xz]
+    def forward(self, template_list, search_list, text_src, seq, anno):
+        xz = self.forward_features(template_list, search_list, text_src, seq, anno)
+        out = [xz]
         return out
 
     def forward_rgb(self, template_list, search_list):

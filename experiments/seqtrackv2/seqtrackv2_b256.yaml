@@ -77,7 +77,7 @@ TRAIN:
   FIX_BN: True
   PRETRAINED_PATH: '/home/cscv/Documents/lsl/SeqTrackv2/pretrained/seqtrack/seqtrack_b256/SEQTRACK_ep0500.pth.tar'
 TEST:
-  EPOCH: 35
+  EPOCH: 40
   SEARCH_FACTOR: 4.0
   SEARCH_SIZE: 256
   TEMPLATE_FACTOR: 4.0

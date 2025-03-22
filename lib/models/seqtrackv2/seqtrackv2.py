@@ -66,7 +66,7 @@ class SEQTRACKV2(nn.Module):
 
 
     def forward(self, template_list=None, search_list=None, text_data=None, text_src=None,
-                xz=None, seq=None, mode="encoder"):
+                xz=None, seq=None, z_anno=None, mode="encoder"):
         """
         image_list: list of template and search images, template images should precede search images
         xz: feature from encoder
@@ -76,17 +76,17 @@ class SEQTRACKV2(nn.Module):
         if mode == "language":
             return self.forward_text(text_data)
         elif mode == "encoder":
-            return self.forward_encoder(template_list, search_list, text_src, seq)
+            return self.forward_encoder(template_list, search_list, text_src, seq, z_anno)
         elif mode == "decoder":
             return self.forward_decoder(xz, seq)
         else:
             raise ValueError
 
-    def forward_encoder(self, template_list, search_list, text_src, seq):
+    def forward_encoder(self, template_list, search_list, text_src, seq, z_anno):
         # Forward the encoder
         # TODO convert seq to instruct tokens
         seq = seq[:,0] - self.decoder.embedding.vocab_size
-        xz = self.encoder(template_list, search_list, text_src, seq)
+        xz = self.encoder(template_list, search_list, text_src, seq, z_anno)
         return xz
 
     def forward_decoder(self, xz, sequence):
@@ -114,13 +114,15 @@ class SEQTRACKV2(nn.Module):
 
         return out
 
-    def inference_encoder(self, template_list, search_list, text_src, multi_modal_vision, seq):
+    def inference_encoder(self, template_list, search_list, template_anno_list, text_src, multi_modal_vision, seq):
         # Forward the encoder
         if not multi_modal_vision:
             xz = self.encoder.forward_rgb(template_list, search_list)
         else:
             seq = seq[:, 0] - self.decoder.embedding.vocab_size
-            xz = self.encoder(template_list, search_list, text_src, seq)
+            template_anno_list = torch.stack(template_anno_list, dim=1)  # (b,n,4)
+            template_anno_list = template_anno_list.view(-1, *template_anno_list.size()[2:])  # (bn,4)
+            xz = self.encoder(template_list, search_list, text_src, seq, template_anno_list)
         return xz
 
 

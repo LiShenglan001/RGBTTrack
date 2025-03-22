@@ -52,6 +52,12 @@ class SeqTrackV2Actor(BaseActor):
         targets = torch.max(targets, torch.tensor([0.]).to(targets)) # Truncate out-of-range values
         targets = torch.min(targets, torch.tensor([1.]).to(targets))
 
+        # box of template region
+        z_anno = data['template_anno'].permute(1, 0, 2).reshape(-1, data['template_anno'].shape[2])  # x0y0wh
+        z_anno = box_xywh_to_xyxy(z_anno)  # x0y0wh --> x0y0x1y1
+        z_anno = torch.max(z_anno, torch.tensor([0.]).to(z_anno))  # Truncate out-of-range values
+        z_anno = torch.min(z_anno, torch.tensor([1.]).to(z_anno))
+
         # different formats of sequence, for ablation study
         seq_format = self.seq_format
         if seq_format != 'corner':
@@ -69,7 +75,7 @@ class SeqTrackV2Actor(BaseActor):
         instruct_tokens_batch = torch.tensor(instruct_tokens_batch).to(box).view(-1,1)
 
         input_seqs = torch.cat([instruct_tokens_batch, box], dim=1)
-        input_seqs = input_seqs.reshape(b,n,input_seqs.shape[-1])
+        input_seqs = input_seqs.reshape(b, n, input_seqs.shape[-1])
         input_seqs = input_seqs.flatten(1)
 
         # target sequence
@@ -85,7 +91,7 @@ class SeqTrackV2Actor(BaseActor):
         text_src = self.net(text_data=text_data, mode='language')
         feature_xz = self.net(template_list=template_list, search_list=search_list,
                               text_src=text_src,
-                              seq=input_seqs, mode='encoder') # forward the encoder
+                              seq=input_seqs, z_anno=z_anno, mode='encoder') # forward the encoder
         outputs = self.net(xz=feature_xz, seq=input_seqs, mode="decoder")
 
         outputs = outputs[-1].view(-1, outputs.size(-1))

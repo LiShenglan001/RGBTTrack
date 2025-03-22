@@ -76,15 +76,22 @@ class SEQTRACKV2(BaseTracker):
         #     image = np.concatenate((image, image), axis=-1)
 
         # get the initial templates
-        z_patch_arr, _ = sample_target(image, info['init_bbox'], self.params.template_factor,
+        z_patch_arr, resize_factor = sample_target(image, info['init_bbox'], self.params.template_factor,
                                        output_sz=self.params.template_size)
 
         template = self.preprocessor.process(z_patch_arr)
         if self.multi_modal_vision and (template.size(1) == 3):
             template = torch.cat((template, template), axis=1)
-
         self.template_list = [template] * self.num_template
 
+        self.state = info['init_bbox']
+        prev_box_crop = transform_image_to_crop(torch.tensor(info['init_bbox']),
+                                                torch.tensor(info['init_bbox']),
+                                                resize_factor,
+                                                torch.Tensor([self.params.template_size, self.params.template_size]),
+                                                normalize=True)
+        self.template_anno_list = [prev_box_crop.to(template.device).unsqueeze(0)]
+        self.frame_id = 0
         # get the initial sequence i.e., [start]
         batch = template.shape[0]
         self.init_seq = (torch.ones([batch, 1]).to(template) * self.instruct_token).type(dtype=torch.int64)
@@ -95,8 +102,6 @@ class SEQTRACKV2(BaseTracker):
         with torch.no_grad():
             self.text_src = self.network.forward_text(text_data=text_data)
 
-        self.state = info['init_bbox']
-        self.frame_id = 0
 
     def track(self, image, info: dict = None):
         # if (self.multi_modal_vision == True) and (image.shape[-1] == 3):
@@ -114,7 +119,7 @@ class SEQTRACKV2(BaseTracker):
 
         # run the encoder
         with torch.no_grad():
-            xz = self.network.inference_encoder(self.template_list, search_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
+            xz = self.network.inference_encoder(self.template_list, search_list, self.template_anno_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
 
         # run the decoder
         with torch.no_grad():

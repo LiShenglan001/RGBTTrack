@@ -31,8 +31,8 @@ class EncoderBase(nn.Module):
         self.body = encoder
         self.num_channels = num_channels
 
-    def forward(self, template_list, search_list, text_src, seq):
-        xs = self.body(template_list, search_list, text_src, seq)
+    def forward(self, template_list, search_list, text_src, seq, z_anno):
+        xs = self.body(template_list, search_list, text_src, seq, z_anno)
         return xs
 
     def forward_rgb(self, template_list, search_list):
