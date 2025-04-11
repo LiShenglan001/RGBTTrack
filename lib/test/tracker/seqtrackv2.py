@@ -90,7 +90,7 @@ class SEQTRACKV2(BaseTracker):
                                                 resize_factor,
                                                 torch.Tensor([self.params.template_size, self.params.template_size]),
                                                 normalize=True)
-        self.template_anno_list = [prev_box_crop.to(template.device).unsqueeze(0)]
+        self.template_anno_list = [prev_box_crop.to(template.device).unsqueeze(0)] * self.num_template
         self.frame_id = 0
         # get the initial sequence i.e., [start]
         batch = template.shape[0]
@@ -153,6 +153,16 @@ class SEQTRACKV2(BaseTracker):
                 self.template_list.append(template)
                 if len(self.template_list) > self.num_template:
                     self.template_list.pop(1)
+
+                prev_box_crop = transform_image_to_crop(torch.tensor(self.state),
+                                                        torch.tensor(self.state),
+                                                        resize_factor,
+                                                        torch.Tensor(
+                                                        [self.params.template_size, self.params.template_size]),
+                                                        normalize=True)
+                self.template_anno_list.append(prev_box_crop.to(template.device).unsqueeze(0))
+                if len(self.template_anno_list) > self.num_template:
+                    self.template_anno_list.pop(1)
 
         # for debug
         if image.shape[-1] == 6:

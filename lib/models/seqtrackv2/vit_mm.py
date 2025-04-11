@@ -26,6 +26,7 @@ import torch.utils.model_zoo as model_zoo
 import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 import math
+import cv2
 from functools import partial
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
@@ -194,6 +195,19 @@ class Interface_block(nn.Module, ):
         x0 = x0 + x1
         return self.conv1x1(x0)
 
+class GatedFusion(nn.Module):
+    def __init__(self, feat_dim=768):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(3 * feat_dim, 3),
+            nn.Softmax(dim=-1)
+        )
+    def forward(self, rgb, thermal, text):
+        combined = torch.cat([rgb, thermal, text], dim=-1)
+        weights = self.gate(combined)
+        fused = weights[:, 0:1] * rgb + weights[:, 1:2] * thermal + weights[:, 2:3] * text
+        return fused
+
 class VisionTransformerMM(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -224,15 +238,16 @@ class VisionTransformerMM(nn.Module):
         # self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches_search + self.num_patches_template, embed_dim))
         self.pos_embed_search = nn.Parameter(torch.zeros(1, self.num_patches_search, embed_dim))
         self.pos_embed_template = nn.Parameter(torch.zeros(1, self.num_patches_template, embed_dim))
-
+        self.prototype_indicate = True
         if self.token_type_indicate:
-            self.template_background_token = nn.Parameter(torch.zeros(embed_dim))
-            self.template_foreground_token = nn.Parameter(torch.zeros(embed_dim))
-            self.search_token = nn.Parameter(torch.zeros(embed_dim))
+            self.interface_template_background_token = nn.Parameter(torch.zeros(embed_dim))
+            self.interface_template_foreground_token = nn.Parameter(torch.zeros(embed_dim))
+            self.interface_search_background_token = nn.Parameter(torch.zeros(embed_dim))
+            self.interface_search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
             # self.search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
 
         self.pos_drop = nn.Dropout(p=drop_rate)
-
+        self.interface_gatedfusion = GatedFusion()
         # for multi-modal
         self.interface_type = interface_type
         '''interface parameters'''
@@ -277,15 +292,26 @@ class VisionTransformerMM(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-    def create_mask(self, image, image_anno):
+    def create_mask(self, image, image_anno, search=False):
         height = image.size(2)
         width = image.size(3)
-
-        # Extract bounding box coordinates
-        x0 = (image_anno[:, 0] * width).unsqueeze(1)
-        y0 = (image_anno[:, 1] * height).unsqueeze(1)
-        w = (image_anno[:, 2] * width).unsqueeze(1)
-        h = (image_anno[:, 3] * height).unsqueeze(1)
+        image_anno = image_anno
+        if search is False:
+            image_anno = image_anno.reshape(-1, image_anno.shape[2])  # x0y0wh
+            image_anno = torch.max(image_anno, torch.tensor([0.]).to(image_anno))  # Truncate out-of-range values
+            image_anno = torch.min(image_anno, torch.tensor([1.]).to(image_anno))
+            # Extract bounding box coordinates
+            x0 = (image_anno[:, 0] * width).unsqueeze(1)
+            y0 = (image_anno[:, 1] * height).unsqueeze(1)
+            w = (image_anno[:, 2] * width).unsqueeze(1)
+            h = (image_anno[:, 3] * height).unsqueeze(1)
+        else:
+            image_anno = torch.max(image_anno, torch.tensor([0.]).to(image_anno))  # Truncate out-of-range values
+            image_anno = torch.min(image_anno, torch.tensor([1.]).to(image_anno))
+            x0 = (image_anno[:, 0] * width).unsqueeze(1)
+            y0 = (image_anno[:, 1] * height).unsqueeze(1)
+            w = (image_anno[:, 2] * width).unsqueeze(1)
+            h = (image_anno[:, 3] * height).unsqueeze(1)
 
         # Generate pixel indices
         x_indices = torch.arange(width, device=image.device)
@@ -297,7 +323,6 @@ class VisionTransformerMM(nn.Module):
 
         # Combine x and y masks to get final mask
         mask = x_mask.unsqueeze(1) * y_mask.unsqueeze(2) # (b,h,w)
-
         return mask
     @torch.jit.ignore
     def no_weight_decay(self):
@@ -310,13 +335,48 @@ class VisionTransformerMM(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+    def template_matching(self, template_img, template_bbox, search_img):
+        height = template_img.size(2)
+        width = template_img.size(3)
+        template_img = template_img.cpu().numpy().transpose(0, 2, 3, 1)
+        search_img = search_img.cpu().numpy().transpose(0, 2, 3, 1)
+        search_boxes = []
+        # Extract bounding box coordinates
+        for i in range(search_img.shape[0]):
+            x0 = (template_bbox[i, 0] * width).to(torch.int32)
+            y0 = (template_bbox[i, 1] * height).to(torch.int32)
+            w = (template_bbox[i, 2] * width).to(torch.int32)
+            h = (template_bbox[i, 3] * height).to(torch.int32)
+            template_patch = template_img[i, y0:y0 + h, x0:x0 + w, :]
+
+            result = cv2.matchTemplate(
+                search_img[i], template_patch,
+                method=cv2.TM_CCOEFF_NORMED
+            )
+
+            _, max_val, _, max_loc = cv2.minMaxLoc(result)
+            x, y = max_loc
+            x = x / width
+            y = y / height
+            w = w / width
+            h = h / height
+            search_bbox = [x, y, w, h]
+            search_boxes.append(search_bbox)
+        search_boxes = torch.tensor(search_boxes)
+        return search_boxes
+
+
     def forward_features(self, template_list, search_list, text_src, seq, z_anno):
         num_template = len(template_list)
         num_search = len(search_list)
         if self.instruct:
             instruct_embedding = self.prompt_embeddings(seq).unsqueeze(1)
 
+        z_0 = template_list[0]
+        z_0_rgb = z_0[:, :3, :, :]
+        z_anno_0 = z_anno[:, 0]
         z = torch.stack(template_list, dim=1)#(b,n,c,h,w)
+        b, n, c, h, w = z.shape
         z = z.view(-1, *z.size()[2:])#(bn,c,h,w)
         x = torch.stack(search_list, dim=1)#(b,n,c,h,w)
         x = x.view(-1, *x.size()[2:])#(bn,c,h,w)
@@ -330,17 +390,21 @@ class VisionTransformerMM(nn.Module):
 
         if self.token_type_indicate:
             # generate a foreground mask
-            z_indicate_mask = self.create_mask(z, z_anno)
+            z_indicate_mask = self.create_mask(z_rgb, z_anno)
             z_indicate_mask = z_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size,
                                                                                                  self.patch_size)  # to match the patch embedding
-            z_indicate_mask = z_indicate_mask.mean(dim=(3, 4)).flatten(
-                1)  # elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
+            z_indicate_mask = z_indicate_mask.mean(dim=(3, 4)).flatten(1)  #(32, 256) elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
 
+            # x_anno = self.template_matching(z_0_rgb, z_anno_0, x_rgb)
+            # x_indicate_mask = self.create_mask(x_rgb, x_anno, search=True)
+            # x_indicate_mask = x_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size,
+            #                                                                                      self.patch_size)  # to match the patch embedding
+            # x_indicate_mask = x_indicate_mask.mean(dim=(3, 4)).flatten(1)  # (32, 256) elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
         if self.token_type_indicate:
             # generate the indicate_embeddings for z
-            template_background_token = self.template_background_token.unsqueeze(0).unsqueeze(1).expand(
+            template_background_token = self.interface_template_background_token.unsqueeze(0).unsqueeze(1).expand(
                 z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
-            template_foreground_token = self.template_foreground_token.unsqueeze(0).unsqueeze(1).expand(
+            template_foreground_token = self.interface_template_foreground_token.unsqueeze(0).unsqueeze(1).expand(
                 z_indicate_mask.size(0), z_indicate_mask.size(1), self.embed_dim)
             weighted_foreground = template_foreground_token * z_indicate_mask.unsqueeze(-1)
             weighted_background = template_background_token * (1 - z_indicate_mask.unsqueeze(-1))
@@ -352,7 +416,23 @@ class VisionTransformerMM(nn.Module):
         if self.interface_type in ['low-rank_add']:
             z_dte = self.patch_embed_interface(z_dte)
             x_dte = self.patch_embed_interface(x_dte)
-            z_dte, x_dte = self.language_interface(z_dte, x_dte, text_src) # add language information
+            if self.prototype_indicate:
+                prototype_v = torch.mean(z_rgb * z_indicate_mask.unsqueeze(-1), dim=1) #(32, 768)
+                prototype_i = torch.mean(z_dte * z_indicate_mask.unsqueeze(-1), dim=1)  # (32, 768)
+                prototype_text = text_src.repeat(2, 1)
+                z_prototype = prototype_v + prototype_i + prototype_text
+                # z_prototype = self.interface_gatedfusion(prototype_v, prototype_i, prototype_text)
+                z_prototype_v = prototype_v.view(b, n, -1).mean(dim=1)
+                similarity = torch.matmul(x_rgb, z_prototype_v.unsqueeze(-1))
+                x_indicate_mask = torch.sigmoid(similarity).squeeze(-1)
+                x_prototype_v = torch.mean(x_rgb * x_indicate_mask.unsqueeze(-1), dim=1)  # (16, 768)
+                x_prototype_i = torch.mean(x_dte * x_indicate_mask.unsqueeze(-1), dim=1)  # (16, 768)
+                x_prototype_text = text_src
+                x_prototype = x_prototype_v + x_prototype_i + x_prototype_text
+                # x_prototype = self.interface_gatedfusion(x_prototype_v, x_prototype_i, x_prototype_text)
+                # #compute prototype similiraty to get search mask
+            z_dte, x_dte = self.language_interface(z_dte, x_dte, text_src, x_prototype, z_prototype)  # add language information
+            # z_dte, x_dte = self.language_interface(z_dte, x_dte, text_src) # add language information
             z_rgb_feat = token2feature(self.interface_norms[0](z_rgb))
             x_rgb_feat = token2feature(self.interface_norms[0](x_rgb))
             z_dte_feat = token2feature(self.interface_norms[0](z_dte))
@@ -368,8 +448,16 @@ class VisionTransformerMM(nn.Module):
             z = z + self.pos_embed_template
             x = x + self.pos_embed_search
             if self.token_type_indicate:
+                search_background_token = self.interface_search_background_token.unsqueeze(0).unsqueeze(1).expand(
+                    x_indicate_mask.size(0), x_indicate_mask.size(1), self.embed_dim)
+                search_foreground_token = self.interface_search_foreground_token.unsqueeze(0).unsqueeze(1).expand(
+                    x_indicate_mask.size(0), x_indicate_mask.size(1), self.embed_dim)
+                x_weighted_foreground = search_foreground_token * x_indicate_mask.unsqueeze(-1)
+                x_weighted_background = search_background_token * (1 - x_indicate_mask.unsqueeze(-1))
+                x_indicate = x_weighted_foreground + x_weighted_background
                 # generate the indicate_embeddings for x
-                x_indicate = self.search_token.unsqueeze(0).unsqueeze(1).expand(x.size(0), x.size(1), self.embed_dim)
+                # x_indicate = self.interface_search_token.unsqueeze(0).unsqueeze(1).expand(x.size(0), x.size(1),
+                #                                                                           self.embed_dim)
                 # add indicate_embeddings to z and x
                 x = x + x_indicate
                 z = z + z_indicate
@@ -411,8 +499,8 @@ class VisionTransformerMM(nn.Module):
                     x_feat = self.interface_blocks[i](x_feat)
                     z_dte = feature2token(z_feat)
                     x_dte = feature2token(x_feat)
-                    x_dte = x_dte.reshape(-1,num_search*x_dte.size(1),x_dte.size(-1))
-                    z_dte = z_dte.reshape(-1,num_template*z_dte.size(1),z_dte.size(-1))
+                    x_dte = x_dte.reshape(-1, num_search*x_dte.size(1),x_dte.size(-1))
+                    z_dte = z_dte.reshape(-1, num_template*z_dte.size(1),z_dte.size(-1))
                     xz_dte = torch.cat([x_dte, z_dte], dim=1)
                     xz = xz_ori + xz_dte
                     if self.instruct:
@@ -473,11 +561,13 @@ class VisionTransformerMM(nn.Module):
         out=[xz]
         return out
 
-    def language_interface(self, z_dte, x_dte, text_src):
+    def language_interface(self, z_dte, x_dte, text_src, x_prototype, z_prototype):
         text_src = text_src.unsqueeze(1)
         x_dte = x_dte * text_src
-        text_src_z = text_src.expand(-1,self.num_template,-1).reshape(text_src.size(0)*self.num_template,1,-1)
+        x_dte = x_dte * x_prototype.unsqueeze(1) + x_dte
+        text_src_z = text_src.expand(-1, self.num_template, -1).reshape(text_src.size(0)*self.num_template,1,-1)
         z_dte = z_dte * text_src_z
+        z_dte = z_dte * z_prototype.unsqueeze(1) + z_dte
         return z_dte, x_dte
 
 @register_model

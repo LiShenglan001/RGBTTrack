@@ -121,7 +121,7 @@ class SEQTRACKV2(nn.Module):
         else:
             seq = seq[:, 0] - self.decoder.embedding.vocab_size
             template_anno_list = torch.stack(template_anno_list, dim=1)  # (b,n,4)
-            template_anno_list = template_anno_list.view(-1, *template_anno_list.size()[2:])  # (bn,4)
+            # template_anno_list = template_anno_list.view(-1, *template_anno_list.size()[2:])  # (bn,4)
             xz = self.encoder(template_list, search_list, text_src, seq, template_anno_list)
         return xz
 

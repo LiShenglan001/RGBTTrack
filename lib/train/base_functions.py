@@ -234,7 +234,6 @@ def get_optimizer_scheduler(net, cfg):
         for n, p in net.named_parameters():
             if ("prompt" not in n) and ("interface" not in n):
                 p.requires_grad = False
-
         if is_main_process():
             print("Learnable parameters are shown below.")
             for n, p in net.named_parameters():

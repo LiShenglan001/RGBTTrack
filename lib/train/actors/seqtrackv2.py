@@ -53,10 +53,11 @@ class SeqTrackV2Actor(BaseActor):
         targets = torch.min(targets, torch.tensor([1.]).to(targets))
 
         # box of template region
-        z_anno = data['template_anno'].permute(1, 0, 2).reshape(-1, data['template_anno'].shape[2])  # x0y0wh
-        z_anno = box_xywh_to_xyxy(z_anno)  # x0y0wh --> x0y0x1y1
-        z_anno = torch.max(z_anno, torch.tensor([0.]).to(z_anno))  # Truncate out-of-range values
-        z_anno = torch.min(z_anno, torch.tensor([1.]).to(z_anno))
+        z_anno = data['template_anno'].permute(1, 0, 2)
+        # z_anno = data['template_anno'].permute(1, 0, 2).reshape(-1, data['template_anno'].shape[2])  # x0y0wh
+        # z_anno = box_xywh_to_xyxy(z_anno)  # x0y0wh --> x0y0x1y1
+        # z_anno = torch.max(z_anno, torch.tensor([0.]).to(z_anno))  # Truncate out-of-range values
+        # z_anno = torch.min(z_anno, torch.tensor([1.]).to(z_anno))
 
         # different formats of sequence, for ablation study
         seq_format = self.seq_format
@@ -86,7 +87,7 @@ class SeqTrackV2Actor(BaseActor):
         target_seqs = target_seqs.type(dtype=torch.int64)
 
         # text input
-        text_data = NestedTensor(data['nl_token_ids'].permute(1,0), data['nl_token_masks'].permute(1,0))
+        text_data = NestedTensor(data['nl_token_ids'].permute(1, 0), data['nl_token_masks'].permute(1,0))
 
         text_src = self.net(text_data=text_data, mode='language')
         feature_xz = self.net(template_list=template_list, search_list=search_list,
