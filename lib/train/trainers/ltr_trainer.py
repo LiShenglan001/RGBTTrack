@@ -69,10 +69,10 @@ class LTRTrainer(BaseTrainer):
             data['settings'] = self.settings
             # forward pass
             if not self.use_amp:
-                loss, stats = self.actor(data)
+                loss, stats = self.actor(data, self.epoch)
             else:
                 with autocast():
-                    loss, stats = self.actor(data)
+                    loss, stats = self.actor(data, self.epoch)
 
             # backward pass and update weights
             if loader.training:
@@ -97,13 +97,19 @@ class LTRTrainer(BaseTrainer):
             self._print_stats(i, loader, batch_size)
 
 
-    def train_epoch(self):
+    def train_epoch(self, max_epochs):
         """Do one epoch for each loader."""
         for loader in self.loaders:
             if self.epoch % loader.epoch_interval == 0:
                 # 2021.1.10 Set epoch
                 if isinstance(loader.sampler, DistributedSampler):
                     loader.sampler.set_epoch(self.epoch)
+                # if self.epoch < 10:
+                #     alpha_start = 0.3
+                #     alpha_end = 0.0
+                #     alpha = max(alpha_end, alpha_start - (self.epoch / max_epochs) * (alpha_start - alpha_end))
+                # else:
+                #     alpha = 0.0
                 self.cycle_dataset(loader)
 
         self._stats_new_epoch()

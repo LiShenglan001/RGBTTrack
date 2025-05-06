@@ -13,7 +13,7 @@ class BaseActor:
         self.net = net
         self.objective = objective
 
-    def __call__(self, data: TensorDict):
+    def __call__(self, data: TensorDict, alpha):
         """ Called in each training iteration. Should pass in input data through the network, calculate the loss, and
         return the training stats for the input data
         args:

@@ -119,7 +119,7 @@ class SEQTRACKV2(BaseTracker):
 
         # run the encoder
         with torch.no_grad():
-            xz = self.network.inference_encoder(self.template_list, search_list, self.template_anno_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
+            xz, attn = self.network.inference_encoder(self.template_list, search_list, self.template_anno_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
 
         # run the decoder
         with torch.no_grad():

@@ -81,7 +81,7 @@ class BaseTrainer:
                 for epoch in range(self.epoch+1, max_epochs+1):
                     self.epoch = epoch
 
-                    self.train_epoch()
+                    self.train_epoch(max_epochs)
 
                     if self.lr_scheduler is not None:
                         if self.settings.scheduler_type != 'cosine':
@@ -92,7 +92,7 @@ class BaseTrainer:
                     save_every_epoch = getattr(self.settings, "save_every_epoch", False)
                     # save every 10 epochs
                     # save_every_epoch = True
-                    if epoch > (max_epochs - 10) or save_every_epoch or epoch % 5 == 0:
+                    if epoch > (max_epochs - 5) or save_every_epoch or epoch % 5 == 0:
                         if self._checkpoint_dir:
                             if self.settings.local_rank in [-1, 0]:
                                 self.save_checkpoint()

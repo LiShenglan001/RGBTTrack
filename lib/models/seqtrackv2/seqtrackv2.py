@@ -66,7 +66,7 @@ class SEQTRACKV2(nn.Module):
 
 
     def forward(self, template_list=None, search_list=None, text_data=None, text_src=None,
-                xz=None, seq=None, z_anno=None, mode="encoder"):
+                xz=None, seq=None, z_anno=None, x_anno=None, current_epoch=None, mode="encoder"):
         """
         image_list: list of template and search images, template images should precede search images
         xz: feature from encoder
@@ -76,18 +76,23 @@ class SEQTRACKV2(nn.Module):
         if mode == "language":
             return self.forward_text(text_data)
         elif mode == "encoder":
-            return self.forward_encoder(template_list, search_list, text_src, seq, z_anno)
+            return self.forward_encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch)
         elif mode == "decoder":
             return self.forward_decoder(xz, seq)
         else:
             raise ValueError
 
-    def forward_encoder(self, template_list, search_list, text_src, seq, z_anno):
+    def forward_encoder(self, template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=None):
         # Forward the encoder
         # TODO convert seq to instruct tokens
-        seq = seq[:,0] - self.decoder.embedding.vocab_size
-        xz = self.encoder(template_list, search_list, text_src, seq, z_anno)
-        return xz
+        if self.training:
+            seq = seq[:, 0] - self.decoder.embedding.vocab_size
+            xz, attn, volume_loss = self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xz, attn, volume_loss
+        else:
+            seq = seq[:, 0] - self.decoder.embedding.vocab_size
+            xz, attn = self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xz, attn
 
     def forward_decoder(self, xz, sequence):
 
@@ -122,7 +127,7 @@ class SEQTRACKV2(nn.Module):
             seq = seq[:, 0] - self.decoder.embedding.vocab_size
             template_anno_list = torch.stack(template_anno_list, dim=1)  # (b,n,4)
             # template_anno_list = template_anno_list.view(-1, *template_anno_list.size()[2:])  # (bn,4)
-            xz = self.encoder(template_list, search_list, text_src, seq, template_anno_list)
+            xz = self.encoder(template_list, search_list, text_src, seq, template_anno_list, x_anno=None, current_epoch=None)
         return xz
 
 

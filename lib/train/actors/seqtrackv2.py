@@ -4,6 +4,7 @@ import torch
 from lib.train.admin import multigpu
 import torch.nn as nn
 from lib.utils.misc import NestedTensor
+import torch.nn.functional as F
 
 
 class SeqTrackV2Actor(BaseActor):
@@ -18,7 +19,7 @@ class SeqTrackV2Actor(BaseActor):
         self.instruct_tokens = net.decoder.instruct_tokens
         self.seq_format = net.seq_format
 
-    def __call__(self, data):
+    def __call__(self, data, current_epoch=None):
         """
         args:
             data - The input data, should contain the fields 'template', 'search', 'search_anno'.
@@ -29,14 +30,14 @@ class SeqTrackV2Actor(BaseActor):
             status  -  dict containing detailed losses
         """
         # forward pass
-        outputs, target_seqs = self.forward_pass(data)
+        outputs, target_seqs, attn, volume_loss = self.forward_pass(data, current_epoch=current_epoch)
 
         # compute losses
-        loss, status = self.compute_losses(outputs, target_seqs)
+        loss, status = self.compute_losses(outputs, target_seqs, volume_loss)
 
         return loss, status
 
-    def forward_pass(self, data):
+    def forward_pass(self, data, current_epoch=None):
         n, b, _, _, _ = data['search_images'].shape   # n,b,c,h,w
         search_img = data['search_images'].view(-1, *data['search_images'].shape[2:])  # (n*b, c, h, w)
         search_list = search_img.split(b,dim=0)
@@ -54,6 +55,7 @@ class SeqTrackV2Actor(BaseActor):
 
         # box of template region
         z_anno = data['template_anno'].permute(1, 0, 2)
+        x_anno = data['search_anno'].permute(1, 0, 2)
         # z_anno = data['template_anno'].permute(1, 0, 2).reshape(-1, data['template_anno'].shape[2])  # x0y0wh
         # z_anno = box_xywh_to_xyxy(z_anno)  # x0y0wh --> x0y0x1y1
         # z_anno = torch.max(z_anno, torch.tensor([0.]).to(z_anno))  # Truncate out-of-range values
@@ -90,20 +92,33 @@ class SeqTrackV2Actor(BaseActor):
         text_data = NestedTensor(data['nl_token_ids'].permute(1, 0), data['nl_token_masks'].permute(1,0))
 
         text_src = self.net(text_data=text_data, mode='language')
-        feature_xz = self.net(template_list=template_list, search_list=search_list,
+        feature_xz, attn, volume_loss = self.net(template_list=template_list, search_list=search_list,
                               text_src=text_src,
-                              seq=input_seqs, z_anno=z_anno, mode='encoder') # forward the encoder
+                              seq=input_seqs, z_anno=z_anno, x_anno=x_anno, current_epoch=current_epoch, mode='encoder') # forward the encoder
         outputs = self.net(xz=feature_xz, seq=input_seqs, mode="decoder")
 
         outputs = outputs[-1].view(-1, outputs.size(-1))
 
-        return outputs, target_seqs
+        return outputs, target_seqs, attn, volume_loss
 
-    def compute_losses(self, outputs, targets_seq, return_status=True):
+    def compute_losses(self, outputs, targets_seq, volume_loss, return_status=True):
         # Get loss
         ce_loss = self.objective['ce'](outputs, targets_seq)
+        # x_gt_mask = self.create_mask(targets)
+        # x_gt_mask = x_gt_mask.unfold(1, 16, 16).unfold(2, 16, 16)  # to match the patch embedding
+        # x_gt_mask = x_gt_mask.mean(dim=(3, 4)).flatten(1)
+        # hard_label = (x_gt_mask > 0.5).long()
+        # gamma = 2.0
+        # alpha = 0.9
+        # decision = decision.permute(0, 2, 1)
+        # pt = F.softmax(decision, dim=1)
+        # log_pt = F.log_softmax(decision, dim=1)
+        # focal_weight = (1-pt).pow(2)
+        # focal_loss = - (focal_weight * log_pt).gather(1, hard_label.unsqueeze(1)).squeeze(1).mean()
+        # decision = decision.detach().cpu().numpy()
+        # class_loss = F.cross_entropy(decision.permute(0, 2, 1), hard_label, weight=torch.tensor([1.0, 22.0]).cuda())
         # weighted sum
-        loss = self.loss_weight['ce'] * ce_loss
+        loss = self.loss_weight['ce'] * ce_loss + 0.2 * volume_loss
 
         outputs = outputs.softmax(-1)
         outputs = outputs[:, :self.bins]
@@ -117,10 +132,32 @@ class SeqTrackV2Actor(BaseActor):
         if return_status:
             # status for log
             status = {"Loss/total": loss.item(),
-                      "IoU": iou.item()}
+                      "IoU": iou.item(),
+                      "volume_loss": volume_loss.item()}
             return loss, status
         else:
             return loss
+
+    def create_mask(self, image_anno):
+        height = 256
+        width = 256
+
+        x0 = ((image_anno[:, 0]-image_anno[:, 2]/2) * width).unsqueeze(1)
+        y0 = ((image_anno[:, 1]-image_anno[:, 3]/2) * height).unsqueeze(1)
+        w = (image_anno[:, 2] * width).unsqueeze(1)
+        h = (image_anno[:, 3] * height).unsqueeze(1)
+
+        # Generate pixel indices
+        x_indices = torch.arange(width, device=image_anno.device)
+        y_indices = torch.arange(height, device=image_anno.device)
+
+        # Create masks for x and y coordinates within the bounding boxes
+        x_mask = ((x_indices >= x0) & (x_indices < x0 + w)).float()
+        y_mask = ((y_indices >= y0) & (y_indices < y0 + h)).float()
+
+        # Combine x and y masks to get final mask
+        mask = x_mask.unsqueeze(1) * y_mask.unsqueeze(2) # (b,h,w)
+        return mask
 
     def to(self, device):
         """ Move the network to device

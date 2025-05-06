@@ -28,12 +28,13 @@ import torch.nn.functional as F
 import math
 import cv2
 from functools import partial
-
+import numpy as np
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
 from .utils import combine_tokens, token2feature, feature2token
-
+from .volume import volume_computation3
+from ...utils.ce_utils import generate_mask_cond, adjust_keep_rate
 
 def _cfg(url='', **kwargs):
     return {
@@ -127,7 +128,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, return_attention=False):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
@@ -139,10 +140,107 @@ class Attention(nn.Module):
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
+        if return_attention:
+            return x, attn
         return x
 
+def candidate_elimination(attn: torch.Tensor, tokens: torch.Tensor, lens_t: int, keep_ratio: float, global_index: torch.Tensor, box_mask_z: torch.Tensor):
+    """
+    Eliminate potential background candidates for computation reduction and noise cancellation.
+    Args:
+        attn (torch.Tensor): [B, num_heads, L_t + L_s, L_t + L_s], attention weights
+        tokens (torch.Tensor):  [B, L_t + L_s, C], template and search region tokens
+        lens_t (int): length of template
+        keep_ratio (float): keep ratio of search region tokens (candidates)
+        global_index (torch.Tensor): global index of search region tokens
+        box_mask_z (torch.Tensor): template mask used to accumulate attention weights
 
+    Returns:
+        tokens_new (torch.Tensor): tokens after candidate elimination
+        keep_index (torch.Tensor): indices of kept search region tokens
+        removed_index (torch.Tensor): indices of removed search region tokens
+    """
+    lens_s = attn.shape[-1] - lens_t
+    bs, hn, _, _ = attn.shape
+
+    lens_keep = math.ceil(keep_ratio * lens_s)
+    if lens_keep == lens_s:
+        return tokens, global_index, None
+
+    attn_xz = attn[:, :, :lens_s, lens_s:]
+
+    if box_mask_z is not None:
+        box_mask_z = torch.cat([box_mask_z[0], box_mask_z[1]], dim=1)
+        box_mask_z = box_mask_z.unsqueeze(1).unsqueeze(2)
+        attn_xz = attn_xz.masked_fill(box_mask_z == 0, 0.0)
+        # attn_t = attn_t[:, :, box_mask_z, :]
+        # attn_t = attn_t[box_mask_z]
+        # attn_t = attn_t.view(bs, hn, -1, lens_s)
+        # attn_t = attn_t.mean(dim=2).mean(dim=1)  # B, H, L-T, L_s --> B, L_s
+
+        # attn_t = [attn_t[i, :, box_mask_z[i, :], :] for i in range(attn_t.size(0))]
+        # attn_t = [attn_t[i].mean(dim=1).mean(dim=0) for i in range(len(attn_t))]
+        # attn_t = torch.stack(attn_t, dim=0)
+    attn_score = attn_xz.mean(dim=-1).mean(dim=1)  # B, H, L-T, L_s --> B, L_s
+
+    # use sort instead of topk, due to the speed issue
+    # https://github.com/pytorch/pytorch/issues/22812
+    sorted_attn, indices = torch.sort(attn_score, dim=1, descending=True)
+
+    topk_attn, topk_idx = sorted_attn[:, :lens_keep], indices[:, :lens_keep]
+    non_topk_attn, non_topk_idx = sorted_attn[:, lens_keep:], indices[:, lens_keep:]
+
+    keep_index = global_index.gather(dim=1, index=topk_idx)
+    removed_index = global_index.gather(dim=1, index=non_topk_idx)
+
+    # separate template and search tokens
+    tokens_s = tokens[:, :lens_s]
+    tokens_t = tokens[:, lens_s:]
+    # obtain the attentive and inattentive tokens
+    B, L, C = tokens_s.shape
+    # topk_idx_ = topk_idx.unsqueeze(-1).expand(B, lens_keep, C)
+    attentive_tokens = tokens_s.gather(dim=1, index=topk_idx.unsqueeze(-1).expand(B, -1, C))
+    inattentive_tokens = tokens_s.gather(dim=1, index=non_topk_idx.unsqueeze(-1).expand(B, -1, C))
+
+    #NullSpace Projection
+    U, S, Vh = torch.linalg.svd(attentive_tokens, full_matrices=False)
+    P = torch.matmul(Vh.transpose(-2, -1), Vh)
+    inattentive_tokens_proj = inattentive_tokens - torch.matmul(inattentive_tokens, P)
+    # compute the weighted combination of inattentive tokens
+    # fused_token = non_topk_attn @ inattentive_tokens
+
+    # concatenate these tokens
+    # tokens_new = torch.cat([tokens_t, attentive_tokens, fused_token], dim=0)
+    tokens_x_new = torch.cat([attentive_tokens, inattentive_tokens_proj], dim=1)
+    tokens_new = torch.cat([tokens_x_new, tokens_t], dim=1)
+
+    return tokens_new, keep_index, removed_index
 class Block(nn.Module):
+
+    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, keep_ratio_search=1.0,):
+        super().__init__()
+        self.norm1 = norm_layer(dim)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.norm2 = norm_layer(dim)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+
+        self.keep_ratio_search = keep_ratio_search
+
+    def forward(self, x, global_index_template, global_index_search, ce_template_mask=None, keep_ratio_search=None, instruct=True):
+        x_attn, attn = self.attn(self.norm1(x), True)
+        x = x + self.drop_path(x_attn)
+        lens_t = global_index_template.shape[1]
+        removed_index_search = None
+        if self.keep_ratio_search < 1 and (keep_ratio_search is None or keep_ratio_search < 1):
+            keep_ratio_search = self.keep_ratio_search if keep_ratio_search is None else keep_ratio_search
+            x, global_index_search, removed_index_search = candidate_elimination(attn, x, lens_t, keep_ratio_search, global_index_search, ce_template_mask)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x, global_index_template, global_index_search, removed_index_search, attn
+class Block_ori(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
@@ -157,9 +255,10 @@ class Block(nn.Module):
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
     def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
+        feat, attn = self.attn(self.norm1(x), True)
+        x = x + self.drop_path(feat)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+        return x, attn
 
 
 class PatchEmbed(nn.Module):
@@ -195,19 +294,6 @@ class Interface_block(nn.Module, ):
         x0 = x0 + x1
         return self.conv1x1(x0)
 
-class GatedFusion(nn.Module):
-    def __init__(self, feat_dim=768):
-        super().__init__()
-        self.gate = nn.Sequential(
-            nn.Linear(3 * feat_dim, 3),
-            nn.Softmax(dim=-1)
-        )
-    def forward(self, rgb, thermal, text):
-        combined = torch.cat([rgb, thermal, text], dim=-1)
-        weights = self.gate(combined)
-        fused = weights[:, 0:1] * rgb + weights[:, 1:2] * thermal + weights[:, 2:3] * text
-        return fused
-
 class VisionTransformerMM(nn.Module):
     """ Vision Transformer with support for patch or hybrid CNN input stage
     """
@@ -216,7 +302,7 @@ class VisionTransformerMM(nn.Module):
                  num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None, drop_rate=0., attn_drop_rate=0.,
                  drop_path_rate=0., hybrid_backbone=None, norm_layer=nn.LayerNorm,
                  search_number=1, template_number=1, use_checkpoint=False,
-                 interface_type=None, interface_dim=8, instruct=True):
+                 interface_type=None, interface_dim=8, instruct=True, gauss=False, early=True):
         super().__init__()
         self.use_checkpoint = use_checkpoint
         self.num_classes = num_classes
@@ -245,9 +331,9 @@ class VisionTransformerMM(nn.Module):
             self.interface_search_background_token = nn.Parameter(torch.zeros(embed_dim))
             self.interface_search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
             # self.search_foreground_token = nn.Parameter(torch.zeros(embed_dim))
+            self.contra_temp = nn.Parameter(torch.tensor(0.07))
 
         self.pos_drop = nn.Dropout(p=drop_rate)
-        self.interface_gatedfusion = GatedFusion()
         # for multi-modal
         self.interface_type = interface_type
         '''interface parameters'''
@@ -268,13 +354,30 @@ class VisionTransformerMM(nn.Module):
 
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule
-        self.blocks = nn.ModuleList([
-            Block(
-                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
-            for i in range(depth)])
+        self.ce_NullSpace = True
+        if self.ce_NullSpace:
+            ce_index = 0
+            ce_loc = [3, 6, 9]
+            self.ce_loc = ce_loc
+            ce_keep_ratio = [0.7, 0.7, 0.7]
+            blocks = []
+            for i in range(depth):
+                ce_keep_ratio_i = 1.0
+                if ce_loc is not None and i in ce_loc:
+                    ce_keep_ratio_i = ce_keep_ratio[ce_index]
+                    ce_index += 1
+                blocks.append(Block(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer, keep_ratio_search=ce_keep_ratio_i))
+            self.blocks = nn.ModuleList(blocks)
+        else:
+            self.blocks = nn.ModuleList([
+                Block(
+                    dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[i], norm_layer=norm_layer)
+                for i in range(depth)])
 
-        self.instruct = instruct
+        self.instruct = True
         if instruct:
             num_embeddings = 4
             self.prompt_embeddings = nn.Embedding(num_embeddings, embed_dim) # should be consistent with new tokens in decoder.instruct_tokens
@@ -306,6 +409,7 @@ class VisionTransformerMM(nn.Module):
             w = (image_anno[:, 2] * width).unsqueeze(1)
             h = (image_anno[:, 3] * height).unsqueeze(1)
         else:
+            image_anno = image_anno.squeeze()
             image_anno = torch.max(image_anno, torch.tensor([0.]).to(image_anno))  # Truncate out-of-range values
             image_anno = torch.min(image_anno, torch.tensor([1.]).to(image_anno))
             x0 = (image_anno[:, 0] * width).unsqueeze(1)
@@ -335,46 +439,14 @@ class VisionTransformerMM(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def template_matching(self, template_img, template_bbox, search_img):
-        height = template_img.size(2)
-        width = template_img.size(3)
-        template_img = template_img.cpu().numpy().transpose(0, 2, 3, 1)
-        search_img = search_img.cpu().numpy().transpose(0, 2, 3, 1)
-        search_boxes = []
-        # Extract bounding box coordinates
-        for i in range(search_img.shape[0]):
-            x0 = (template_bbox[i, 0] * width).to(torch.int32)
-            y0 = (template_bbox[i, 1] * height).to(torch.int32)
-            w = (template_bbox[i, 2] * width).to(torch.int32)
-            h = (template_bbox[i, 3] * height).to(torch.int32)
-            template_patch = template_img[i, y0:y0 + h, x0:x0 + w, :]
 
-            result = cv2.matchTemplate(
-                search_img[i], template_patch,
-                method=cv2.TM_CCOEFF_NORMED
-            )
-
-            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-            x, y = max_loc
-            x = x / width
-            y = y / height
-            w = w / width
-            h = h / height
-            search_bbox = [x, y, w, h]
-            search_boxes.append(search_bbox)
-        search_boxes = torch.tensor(search_boxes)
-        return search_boxes
-
-
-    def forward_features(self, template_list, search_list, text_src, seq, z_anno):
+    def forward_features(self, template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=None):
         num_template = len(template_list)
         num_search = len(search_list)
         if self.instruct:
             instruct_embedding = self.prompt_embeddings(seq).unsqueeze(1)
 
         z_0 = template_list[0]
-        z_0_rgb = z_0[:, :3, :, :]
-        z_anno_0 = z_anno[:, 0]
         z = torch.stack(template_list, dim=1)#(b,n,c,h,w)
         b, n, c, h, w = z.shape
         z = z.view(-1, *z.size()[2:])#(bn,c,h,w)
@@ -409,7 +481,7 @@ class VisionTransformerMM(nn.Module):
             weighted_foreground = template_foreground_token * z_indicate_mask.unsqueeze(-1)
             weighted_background = template_background_token * (1 - z_indicate_mask.unsqueeze(-1))
             z_indicate = weighted_foreground + weighted_background
-
+        x_rgb_ori = x_rgb
         x_rgb = self.patch_embed(x_rgb)
         z_rgb = self.patch_embed(z_rgb)
 
@@ -421,14 +493,42 @@ class VisionTransformerMM(nn.Module):
                 prototype_i = torch.mean(z_dte * z_indicate_mask.unsqueeze(-1), dim=1)  # (32, 768)
                 prototype_text = text_src.repeat(2, 1)
                 z_prototype = prototype_v + prototype_i + prototype_text
-                # z_prototype = self.interface_gatedfusion(prototype_v, prototype_i, prototype_text)
-                z_prototype_v = prototype_v.view(b, n, -1).mean(dim=1)
-                similarity = torch.matmul(x_rgb, z_prototype_v.unsqueeze(-1))
-                x_indicate_mask = torch.sigmoid(similarity).squeeze(-1)
+                # z_prototype_v = prototype_v.view(b, n, -1).mean(dim=1)
+                volume = volume_computation3(prototype_text, prototype_v, prototype_i)
+                volumeT = volume.T
+                volume = volume / self.contra_temp
+                volumeT = volumeT / self.contra_temp
+                weights = F.softmax(volume, dim=1)
+                z_prototype = torch.matmul(weights, z_prototype)
+                # z_prototype = torch.matmul(weights, z_prototype) + z_prototype
+                x_rgb_reap = x_rgb.repeat(2, 1, 1)
+                x_rgb_norm = F.normalize(x_rgb_reap, dim=-1)
+                fused_proto_norm = F.normalize(z_prototype, dim=-1)
+                sim = torch.sum(x_rgb_norm * fused_proto_norm.unsqueeze(1), dim=-1)
+                attn_weights = F.softmax(sim, dim=-1)
+                sim_mask = attn_weights.view(b, n, -1).mean(dim=1)
+                # if self.training:
+                #     x_indicate_mask = self.create_mask(x_rgb_ori, x_anno, search=True)
+                #     x_indicate_mask = x_indicate_mask.unfold(1, self.patch_size, self.patch_size).unfold(2, self.patch_size,
+                #                                                                                          self.patch_size)  # to match the patch embedding
+                #     x_indicate_mask = x_indicate_mask.mean(dim=(3, 4)).flatten(1)  # (32, 256) elements are in [0,1], float, near to 1 indicates near to foreground, near to 0 indicates near to background
+                #
+                targets = torch.arange(0, prototype_text.size(0)).cuda()
+                volume_loss = (F.cross_entropy(-volume, targets, label_smoothing=0.1)
+                               +F.cross_entropy(-volumeT, targets, label_smoothing=0.1)) / 2
+                #
+                #     x_indicate_mask = alpha * x_indicate_mask + (1 - alpha) * sim_mask
+                # else:
+                x_indicate_mask = sim_mask
                 x_prototype_v = torch.mean(x_rgb * x_indicate_mask.unsqueeze(-1), dim=1)  # (16, 768)
                 x_prototype_i = torch.mean(x_dte * x_indicate_mask.unsqueeze(-1), dim=1)  # (16, 768)
                 x_prototype_text = text_src
                 x_prototype = x_prototype_v + x_prototype_i + x_prototype_text
+                volume = volume_computation3(x_prototype_text, x_prototype_v, x_prototype_i)
+                volume = volume / self.contra_temp
+                weights = F.softmax(volume, dim=1)
+                x_prototype = torch.matmul(weights, x_prototype)
+                # x_prototype = torch.matmul(weights, x_prototype) + x_prototype
                 # x_prototype = self.interface_gatedfusion(x_prototype_v, x_prototype_i, x_prototype_text)
                 # #compute prototype similiraty to get search mask
             z_dte, x_dte = self.language_interface(z_dte, x_dte, text_src, x_prototype, z_prototype)  # add language information
@@ -470,25 +570,26 @@ class VisionTransformerMM(nn.Module):
             xz = torch.cat([x, z], dim=1)
         else:
             raise ValueError('illegal interface_type')
-
+        # if self.prototype_concat:
+        #     xz = torch.cat([z_prototype_all, xz], dim=1)
         if self.instruct:
             xz = torch.cat([instruct_embedding, xz], dim=1)
 
         xz = self.pos_drop(xz)
-
+        attn_list = []
+        removed_indexes_s = []
         for i, blk in enumerate(self.blocks):   #batch is the first dimension.
             if i >= 1:
                 if self.interface_type in ['low-rank_add']:
                     if self.instruct:
                         instruct_embedding = xz[:, 0, :].unsqueeze(1)
                         xz = xz[:, 1:, :]
-                    xz_ori = xz
                     x = xz[:, :len_x, :]
                     z = xz[:, len_x:, :]
-                    x = x.reshape(x.size(0)*num_search,-1,x.size(-1))
-                    z = z.reshape(z.size(0)*num_template,-1,z.size(-1))
-                    x_dte = x_dte.reshape(x_dte.size(0)*num_search,-1,x.size(-1))
-                    z_dte = z_dte.reshape(z_dte.size(0)*num_template,-1,z.size(-1))
+                    x = x.reshape(x.size(0)*num_search, -1, x.size(-1))
+                    z = z.reshape(z.size(0)*num_template, -1, z.size(-1))
+                    x_dte = x_dte.reshape(x_dte.size(0)*num_search, -1, x.size(-1))
+                    z_dte = z_dte.reshape(z_dte.size(0)*num_template, -1, z.size(-1))
                     x_rgb_feat = token2feature(self.interface_norms[i](x))
                     z_rgb_feat = token2feature(self.interface_norms[i](z))
                     x_dte_feat = token2feature(self.interface_norms[i](x_dte))
@@ -499,20 +600,78 @@ class VisionTransformerMM(nn.Module):
                     x_feat = self.interface_blocks[i](x_feat)
                     z_dte = feature2token(z_feat)
                     x_dte = feature2token(x_feat)
-                    x_dte = x_dte.reshape(-1, num_search*x_dte.size(1),x_dte.size(-1))
-                    z_dte = z_dte.reshape(-1, num_template*z_dte.size(1),z_dte.size(-1))
+                    x_dte = x_dte.reshape(-1, num_search*x_dte.size(1), x_dte.size(-1))
+                    z_dte = z_dte.reshape(-1, num_template*z_dte.size(1), z_dte.size(-1))
                     xz_dte = torch.cat([x_dte, z_dte], dim=1)
-                    xz = xz_ori + xz_dte
+                    xz = xz + xz_dte
                     if self.instruct:
                         xz = torch.cat([instruct_embedding, xz], dim=1)
 
             if self.use_checkpoint:
-                xz = checkpoint.checkpoint(blk, xz)
+                xz, attn = checkpoint.checkpoint(blk, xz)
             else:
-                xz = blk(xz)
+                if self.ce_NullSpace:
+                    # box_mask_z = generate_mask_cond(self.cfg, template_list[0].shape[0], template_list[0].device,
+                    #                                 data['template_anno'][0])
+                    if self.training:
+                        ce_start_epoch = 5
+                        ce_warm_epoch = 20
+                        ce_keep_rate = adjust_keep_rate(current_epoch, warmup_epochs=ce_start_epoch,
+                                                        total_epochs=ce_start_epoch + ce_warm_epoch,
+                                                        ITERS_PER_EPOCH=1,
+                                                        base_keep_rate=0.7)
+                    else:
+                        ce_keep_rate = 1
+                    global_index_t = torch.linspace(0, len_z - 1, len_z).cuda()
+                    global_index_t = global_index_t.repeat(b, 1)
 
-        xz = self.norm(xz) # B,N,C
-        return xz
+                    global_index_s = torch.linspace(0, len_x - 1, len_x).cuda()
+                    global_index_s = global_index_s.repeat(b, 1)
+                    z_indicate_mask = z_indicate_mask.view(n, b, -1)
+                    xz, global_index_t, global_index_s, removed_index_s, attn = \
+                        blk(xz, global_index_t, global_index_s, ce_template_mask=z_indicate_mask, keep_ratio_search=ce_keep_rate, instruct=self.instruct)
+
+                    if self.ce_loc is not None and i in self.ce_loc:
+                        removed_indexes_s.append(removed_index_s)
+                else:
+                    xz, attn = blk(xz)
+            attn_list.append(attn)
+        xz = self.norm(xz)  # B,N,C
+        # if self.ce_NullSpace:
+        #     len_x_new = global_index_s.shape[1]
+        #     len_z_new = global_index_t.shape[1]
+        #     if self.instruct:
+        #         instruct_embedding = xz[:, 0, :].unsqueeze(1)
+        #         xz = xz[:, 1:, :]
+        #     x = xz[:, :len_x_new, :]
+        #     z = xz[:, len_x_new:, :]
+        #
+        #     if removed_indexes_s and removed_indexes_s[0] is not None:
+        #         removed_indexes_cat = torch.cat(removed_indexes_s, dim=1)
+        #
+        #         pruned_lens_x = len_x - len_x_new
+        #         pad_x = torch.zeros([b, pruned_lens_x, x.shape[2]], device=x.device)
+        #         x = torch.cat([x, pad_x], dim=1)
+        #         index_all = torch.cat([global_index_s, removed_indexes_cat], dim=1)
+        #         # recover original token order
+        #         C = x.shape[-1]
+        #         # x = x.gather(1, index_all.unsqueeze(-1).expand(B, -1, C).argsort(1))
+        #         x = torch.zeros_like(x).scatter_(dim=1,
+        #                                          index=index_all.unsqueeze(-1).expand(b, -1, C).to(torch.int64),
+        #                                          src=x)
+        #
+        #     x = self.recover_tokens(x, len_z_new, len_x, mode='direct')
+        #
+        #     # re-concatenate with the template, which may be further used by other modules
+        #     xz = torch.cat([x, z], dim=1)
+        #     if self.instruct:
+        #         xz = torch.cat([instruct_embedding, xz], dim=1)
+        attn = torch.cat(attn_list, dim=1).mean(dim=1)
+        search_attn = attn.mean(dim=1)
+        if self.training:
+            return xz, search_attn, volume_loss
+        else:
+            return xz, search_attn
 
     def forward_features_rgb(self, template_list, search_list):
         num_template = len(template_list)
@@ -551,10 +710,15 @@ class VisionTransformerMM(nn.Module):
         xz = self.norm(xz) # B,N,C
         return xz
 
-    def forward(self, template_list, search_list, text_src, seq, anno):
-        xz = self.forward_features(template_list, search_list, text_src, seq, anno)
-        out = [xz]
-        return out
+    def forward(self, template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=None):
+        if self.training:
+            xz, attn, volume_loss = self.forward_features(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            out = [xz]
+            return out, attn, volume_loss
+        else:
+            xz, attn = self.forward_features(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            out = [xz]
+            return out, attn
 
     def forward_rgb(self, template_list, search_list):
         xz = self.forward_features_rgb(template_list, search_list)
@@ -569,6 +733,26 @@ class VisionTransformerMM(nn.Module):
         z_dte = z_dte * text_src_z
         z_dte = z_dte * z_prototype.unsqueeze(1) + z_dte
         return z_dte, x_dte
+
+    def recover_tokens(self, merged_tokens, len_template_token, len_search_token, mode='direct'):
+        if mode == 'direct':
+            recovered_tokens = merged_tokens
+        elif mode == 'template_central':
+            central_pivot = len_search_token // 2
+            len_remain = len_search_token - central_pivot
+            len_half_and_t = central_pivot + len_template_token
+
+            first_half = merged_tokens[:, :central_pivot, :]
+            second_half = merged_tokens[:, -len_remain:, :]
+            template_tokens = merged_tokens[:, central_pivot:len_half_and_t, :]
+
+            recovered_tokens = torch.cat((template_tokens, first_half, second_half), dim=1)
+        elif mode == 'partition':
+            recovered_tokens = merged_tokens
+        else:
+            raise NotImplementedError
+
+        return recovered_tokens
 
 @register_model
 def vitmm_base_patch16(pretrained=False, pretrain_type='default',
