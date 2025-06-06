@@ -98,6 +98,7 @@ class SEQTRACKV2(BaseTracker):
 
         # language information
         init_nlp = info.get("init_nlp", None)
+        # init_nlp = info.get("init_nlp", 'This is a description of target in single object tracking task.')
         text_data = self._text_input_process(init_nlp, self.params.cfg.MODEL.LANGUAGE.BERT.MAX_QUERY_LEN)
         with torch.no_grad():
             self.text_src = self.network.forward_text(text_data=text_data)
@@ -119,7 +120,7 @@ class SEQTRACKV2(BaseTracker):
 
         # run the encoder
         with torch.no_grad():
-            xz, attn = self.network.inference_encoder(self.template_list, search_list, self.template_anno_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
+            xz = self.network.inference_encoder(self.template_list, search_list, self.template_anno_list, self.text_src, self.multi_modal_vision, self.init_seq.clone())
 
         # run the decoder
         with torch.no_grad():

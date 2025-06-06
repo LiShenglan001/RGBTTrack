@@ -182,6 +182,10 @@ class TrackingSampler(torch.utils.data.Dataset):
                 if self.multi_modal_language:
                     # nlp = template_anno['nlp'][0]
                     nlp = template_anno.get("nlp", None)
+                    #determain if we use language info
+                    # flag = random.random()
+                    # if flag < 0.3:
+                    #     nlp = None
                     if nlp is not None:
                         nlp = nlp[0]
                         nlp_token_ids, nlp_token_masks = self.extract_token_from_nlp(nlp, self.max_query_len)

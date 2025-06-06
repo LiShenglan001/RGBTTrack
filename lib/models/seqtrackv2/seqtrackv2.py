@@ -87,12 +87,12 @@ class SEQTRACKV2(nn.Module):
         # TODO convert seq to instruct tokens
         if self.training:
             seq = seq[:, 0] - self.decoder.embedding.vocab_size
-            xz, attn, volume_loss = self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
-            return xz, attn, volume_loss
+            xz, volume_loss = self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xz, volume_loss
         else:
             seq = seq[:, 0] - self.decoder.embedding.vocab_size
-            xz, attn = self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
-            return xz, attn
+            xz= self.encoder(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xz
 
     def forward_decoder(self, xz, sequence):
 

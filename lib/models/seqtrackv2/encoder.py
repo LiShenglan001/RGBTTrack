@@ -33,11 +33,11 @@ class EncoderBase(nn.Module):
 
     def forward(self, template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=None):
         if self.training:
-            xs, attn, volume_loss = self.body(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
-            return xs, attn, volume_loss
+            xs, volume_loss = self.body(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xs, volume_loss
         else:
-            xs, attn = self.body(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
-            return xs, attn
+            xs = self.body(template_list, search_list, text_src, seq, z_anno, x_anno, current_epoch=current_epoch)
+            return xs
 
     def forward_rgb(self, template_list, search_list):
         xs = self.body.forward_rgb(template_list, search_list)

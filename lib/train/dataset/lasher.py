@@ -75,7 +75,7 @@ class LasHeR(BaseVideoDataset):
         return torch.tensor(rgb_gt)
 
     def _read_nlp(self, seq_path):
-        nlp_file = os.path.join(seq_path, "BLIP2.txt")
+        nlp_file = os.path.join(seq_path, "geminipro.txt")
         nlp = ""
         try:
             nlp = pandas.read_csv(nlp_file, dtype=str, header=None, low_memory=False, nrows=1).values

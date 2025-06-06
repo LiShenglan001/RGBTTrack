@@ -30,7 +30,7 @@ class SeqTrackV2Actor(BaseActor):
             status  -  dict containing detailed losses
         """
         # forward pass
-        outputs, target_seqs, attn, volume_loss = self.forward_pass(data, current_epoch=current_epoch)
+        outputs, target_seqs, volume_loss = self.forward_pass(data, current_epoch=current_epoch)
 
         # compute losses
         loss, status = self.compute_losses(outputs, target_seqs, volume_loss)
@@ -92,14 +92,14 @@ class SeqTrackV2Actor(BaseActor):
         text_data = NestedTensor(data['nl_token_ids'].permute(1, 0), data['nl_token_masks'].permute(1,0))
 
         text_src = self.net(text_data=text_data, mode='language')
-        feature_xz, attn, volume_loss = self.net(template_list=template_list, search_list=search_list,
+        feature_xz, volume_loss = self.net(template_list=template_list, search_list=search_list,
                               text_src=text_src,
                               seq=input_seqs, z_anno=z_anno, x_anno=x_anno, current_epoch=current_epoch, mode='encoder') # forward the encoder
         outputs = self.net(xz=feature_xz, seq=input_seqs, mode="decoder")
 
         outputs = outputs[-1].view(-1, outputs.size(-1))
 
-        return outputs, target_seqs, attn, volume_loss
+        return outputs, target_seqs, volume_loss
 
     def compute_losses(self, outputs, targets_seq, volume_loss, return_status=True):
         # Get loss

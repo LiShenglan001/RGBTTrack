@@ -1,4 +1,6 @@
 import os
+import random
+
 # loss function related
 from torch.nn import CrossEntropyLoss
 # train pipeline related

@@ -24,6 +24,7 @@ def load_gemini_model():
     os.environ["HTTPs_PROXY"] = "http://127.0.0.1:7890"
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/home/cscv/Documents/lsl/SeqTrackv2/generate_discription/avid-catalyst-453707-h4-452f6de54af5.json"
     GOOGLE_API_KEY=os.getenv('AIzaSyBVEzCz_ME85lWHTNTfY6r2LfxmzY_fdFo')
+    # GOOGLE_API_KEY = os.getenv('sk-C9Nd8e1cde644cb80ec5ae781b902a1019b35cbab94s0PuW')
     genai.configure(api_key=GOOGLE_API_KEY, transport='rest')
     # creds, project = default()
     # print("Credentials:", creds)
@@ -31,7 +32,7 @@ def load_gemini_model():
     for m in genai.list_models():
         print(m.name)
         print(m.supported_generation_methods)
-    model = genai.GenerativeModel('gemini-1.5-flash') #'gemini-2.0-pro-exp'
+    model = genai.GenerativeModel('gemini-1.5-flash') #'gemini-2.0-pro-exp', gemini-1.5-flash
 
     return model
 
@@ -231,13 +232,14 @@ def to_markdown(text):
     return Markdown(textwrap.indent(text, '>', predicate=lambda _:True))
 
 def generate_caption(image, model):
-    prompt = "Describe this image in one sentence within 20 words, without using any commas and without any additional text."
+    # prompt = "Describe this image in one sentence within 20 words, without using any commas and without any additional text."
     # prompt = """
     # Describe the image in 40 words. Use short phrases. Follow this order:
     # 1. Main subject: appearance, shape, structure, texture, patterns
     # 2. Secondary elements: key features
     # 3. Spatial composition and perspective
     # """
+    prompt = "Prompt: Write a concise and clear English sentence describing the object within the red rectangular frame, referencing its location, appearance, and type to ensure precise identification. The red frame is a prompt for you and should not be included in the generated description. The description should resemble something like: 'A red apple on the table.'"
     # response = model.generate_content([prompt, image], stream=False)
     # response.resolve()
     # description = response.text
@@ -265,7 +267,7 @@ def generate_caption(image, model):
 def save_descriptions_to_file(video_folder_path, context_descriptions):
 
     try:
-        language_file_path = os.path.join(video_folder_path, "BLIP2.txt")
+        language_file_path = os.path.join(video_folder_path, "gemini.txt")
         with open(language_file_path, "w") as f:
             for i in range(len(context_descriptions)):
                 f.write(f"{context_descriptions[i]}\n")
@@ -313,12 +315,16 @@ def describe_object_and_context(image_path, bbox, model, output_img_path):
     return context_descriptions
 
 def process_video_sequences(root_dir, model):
-
+    n = 0
     for video_folder in os.listdir(root_dir):
         video_folder_path = os.path.join(root_dir, video_folder)
         if os.path.isdir(video_folder_path):
             print(f"processing: {video_folder}")
-
+            description = os.path.join(video_folder_path, 'gemini.txt')
+            if os.path.exists(description):
+                n = n + 1
+                print("description exists", n)
+                continue
             visible_folder = os.path.join(video_folder_path, "visible")
             if os.path.exists(visible_folder):
                 print(f"found: {visible_folder}")
@@ -327,9 +333,9 @@ def process_video_sequences(root_dir, model):
                 if image_files:
 
                     image_files.sort()
-                    first_image = image_files[0]
-                    first_image_path = os.path.join(visible_folder, first_image)
-
+                    # first_image = image_files[0]
+                    # first_image_path = os.path.join(visible_folder, first_image)
+                    first_image_path = os.path.join(video_folder_path, 'gt-img.jpg')
                     bbox = read_bbox_from_init(video_folder_path)
                     if bbox is None:
                         print("can't read box")
